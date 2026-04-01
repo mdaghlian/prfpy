@@ -860,4 +860,204 @@ class CFGaussianModel():
         
     
         
+# ************************************************************************************************************
+# CSenF functions
+from .rf import nCSF_response
+class CSenFModel(Model):
+    """CSenFModel
+    CSenF model
+    """
+
+    def __init__(self,
+                 stimulus,
+                 hrf=[1.0, 1.0, 0.0],
+                 filter_predictions=False,
+                 filter_type='dc',
+                 filter_params={},
+                 edge_type='CRF',
+                 width_l_type='asymmetrical',
+                 hrf_basis='SPM',
+                 normalize_hrf=False,                 
+                 ):
+        """
+
+        constructor, sets up stimulus and hrf for this Model
+
+        Parameters
+        ----------
+        stimulus : CSenFStimulus
+            Stimulus object specifying the information about the stimulus,
+            and the space in which it lives. (i.e., contrast and spatial frequencies by time) 
+        hrf : string, list or numpy.ndarray, optional
+            HRF shape for this Model.
+            Can be 'direct', which implements nothing (for eCoG or later convolution),
+            a list or array of 3, which are multiplied with the three spm HRF basis functions,
+            and an array already sampled on the TR by the user.
+            (the default is None, which implements standard spm HRF)
+        filter_predictions : boolean, optional
+            whether to high-pass filter the predictions, default False
+        filter_type, filter_params : see timecourse.py
         
+        edge_type  : Which edge type to use in defaults is CRF (naka rushton)
+            See .rf.nCSF_apply_crf
+            other options are 'binary' etc. 
+
+        width_l_type : str, optional
+            Type of width_l to use; see .rf.nCSF_response
+            Defaults to 'asymmetric' (width_l is specified)             
+            other options are 'symmetric' (width_l = width_r) and 'relative' (width_l = width_r * width_l)
+            
+            
+        
+        
+        """
+        super().__init__(stimulus)
+        self.edge_type = edge_type
+        self.width_l_type = width_l_type
+        self.hrf_basis = hrf_basis
+        self.normalize_hrf = normalize_hrf
+        # HRF 
+        if isinstance(hrf, str):
+            if hrf == 'direct':  # for use with anything like eCoG with instantaneous irf
+                self.hrf = 'direct'
+                # self.stimulus.convolved_design_matrix = np.copy(stimulus.design_matrix)
+            
+        else:
+            # some specific hrf with spm basis set
+            if ((isinstance(hrf, list)) or (isinstance(hrf, np.ndarray))) and len(hrf) == 3:
+                
+                self.hrf_params = np.copy(hrf)
+                
+                if hrf[0] == 1: 
+                    self.hrf = self.create_hrf(hrf_params=hrf, hrf_basis=self.hrf_basis, normalize_hrf=self.normalize_hrf)
+                else:
+                    print("WARNING: hrf[0] is not 1. this will confound it with amplitude\
+                          parameters. consider setting it to 1 unless you are absolutely sure of what you are doing.\
+                          this will also prevent you from fitting the HRF.")
+                    self.hrf = self.create_hrf(hrf_params=hrf, hrf_basis=self.hrf_basis, normalize_hrf=self.normalize_hrf)
+                    
+            # some specific hrf already defined at the TR (!)
+            # elif isinstance(hrf, np.ndarray) and len(hrf) > 3:
+            elif isinstance(hrf, np.ndarray) and hrf.shape[0] == 1 and hrf.shape[1] > 3:
+                self.hrf = np.copy(hrf)
+        
+        
+            # self.stimulus.convolved_design_matrix = convolve_stimulus_dm(
+            #     stimulus.design_matrix, hrf=self.hrf)
+
+
+        # filtering and other stuff
+        self.filter_predictions = filter_predictions
+        self.filter_type = filter_type
+
+        # settings for filter
+        self.filter_params = filter_params
+
+        # adding stimulus parameters - [mostly redundant]
+        self.filter_params['task_lengths'] = self.stimulus.task_lengths
+        self.filter_params['task_names'] = self.stimulus.task_names
+        self.filter_params['late_iso_dict'] = self.stimulus.late_iso_dict
+    
+    def create_grid_predictions(self,
+                                width_r, 
+                                SFp, 
+                                CSp, 
+                                width_l,
+                                crf_exp, 
+                                hrf_1=None,
+                                hrf_2=None):
+        """create_predictions
+
+        creates predictions for a given set of parameters
+
+        see return predictions
+
+        Parameters
+        ----------
+
+        """
+        
+        n_predictions = len(width_r)
+
+        if hrf_1 is not None and hrf_2 is not None:
+            if not hasattr(hrf_1, 'shape') and not hasattr(hrf_2, 'shape'):
+                hrf_1 = hrf_1 * np.ones(n_predictions)
+                hrf_2 = hrf_2 * np.ones(n_predictions)
+        elif hrf_1 is None and hrf_2 is None:
+            hrf_1 = self.hrf_params[1] * np.ones(n_predictions)
+            hrf_2 = self.hrf_params[2] * np.ones(n_predictions)
+        
+        prediction_params = np.array([width_r,
+                                      SFp,
+                                      CSp,
+                                      width_l,
+                                      crf_exp, 
+                                      1.0*np.ones(n_predictions),
+                                      0.0*np.ones(n_predictions),                                     
+                                      hrf_1,
+                                      hrf_2])
+        
+        return self.return_prediction(*list(prediction_params)).astype('float32')
+
+    def return_prediction(self,
+                          width_r,
+                          SFp,
+                          CSp,
+                          width_l,                          
+                          crf_exp,
+                          beta,
+                          baseline,
+                          hrf_1=None,
+                          hrf_2=None):
+        """return_prediction
+
+        returns the prediction for a single set of parameters.
+        As this is to be used during iterative search, it also
+        has arguments beta and baseline.
+
+        Parameters
+        ----------
+        width_r   *** float
+        SFp   *** float
+        CSp   *** float
+        width_l   *** float
+        crf_exp *** float
+        beta : float
+            amplitude of pRF
+        baseline : float
+            baseline of pRF
+        hrf_1, hrf_2 : floats, optional
+            hrf parameters, specified only if hrf is being fit to data, otherwise not needed.
+
+        Returns
+        -------
+        numpy.ndarray
+            single prediction given the model
+        """
+        if hrf_1 is None or hrf_2 is None:
+            current_hrf = self.hrf
+        else:
+            current_hrf = self.create_hrf([1.0, hrf_1, hrf_2], hrf_basis=self.hrf_basis, normalize_hrf=self.normalize_hrf)
+
+        # Create the single rf
+        tc = nCSF_response(
+            SF_seq=self.stimulus.SF_seq,
+            CON_seq=self.stimulus.CON_seq,
+            width_r=width_r,
+            SFp=SFp,
+            CSp=CSp,
+            width_l=width_l,
+            crf_exp=crf_exp,
+            edge_type=self.edge_type,
+            width_l_type=self.width_l_type,
+        )
+        if not isinstance(current_hrf, str): # If not 'direct'
+            tc = self.convolve_timecourse_hrf(tc, current_hrf)
+
+        if not self.filter_predictions:
+            return baseline[..., np.newaxis] + beta[..., np.newaxis] * tc
+        else:
+            return baseline[..., np.newaxis] + beta[..., np.newaxis] * filter_predictions(
+                tc,
+                self.filter_type,
+                self.filter_params)                

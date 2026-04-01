@@ -1816,3 +1816,214 @@ class CFFitter(Fitter):
 
 
  
+# ************************************************************************************************************
+# CSenF functions
+
+class CSenFFitter(Fitter):
+    """CSenFFitter
+
+    Class that implements the different fitting methods
+    on a CSenFModel object
+    """
+
+    def grid_fit(self,
+                 width_r_grid, 
+                 SFp_grid, 
+                 CSp_grid, 
+                 width_l_grid,
+                 crf_exp_grid,
+                 verbose=False,
+                 n_batches=1,
+                 fixed_grid_baseline=None,
+                 grid_bounds=None,
+                 hrf_1_grid=None,
+                 hrf_2_grid=None):
+        """grid_fit
+
+        performs grid fit using provided grids and predictor definitions
+
+
+        Parameters
+        ----------
+        width_r_grid : 1D ndarray
+            array of width_r values in grid
+        SFp_grid : 1D ndarray
+            array of SFp values in grid
+        CSp_grid : 1D ndarray
+            array of CSp values in a grid
+        width_l_grid : 1D ndarray
+            array of width_l values in a grid 
+        crf_exp_grid : 1D ndarray
+            array of crf_exp values in a grid
+        verbose : boolean, optional
+            print output. The default is False.
+        n_batches : int, optional
+            The data is split in n_batches of units and
+            grid fit is performed in parallel.
+        fixed_grid_baseline : float, optional
+            The default is None. If not None, bold baseline will be fixed
+            to this value (recommended).
+        grid_bounds : list containing one tuple, optional
+            The default is None. If not None, only values of pRF amplitude
+            between grid_bounds[0][0] and grid_bounds[0][1] will be allowed.
+            This is generally used to only allow positive pRFs, for example by
+            specifying grid_bounds = [(0,1000)], only pRFs with amplitude
+            between 0 and 1000 will be allowed in the grid fit  
+        hrf_1_grid : 1D ndarray, optional
+            The default is None. If not None, and if 
+            self.use_previous_gaussian_fitter_hrf is False,
+            will perform grid over these values of the hrf_1 parameter.
+        hrf_1_grid : 1D ndarray, optional
+            The default is None. If not None, and if 
+            self.use_previous_gaussian_fitter_hrf is False,
+            will perform grid over these values of the hrf_1 parameter.
+        Returns
+        -------
+        None.
+
+        """
+        # setting up grid for params
+        if hrf_1_grid is None or hrf_2_grid is None:
+            width_r, SFp, CSp, width_l, crf_exp =  np.meshgrid(width_r_grid, SFp_grid, CSp_grid, width_l_grid, crf_exp_grid)
+            self.hrf_1 = None
+            self.hrf_2 = None
+        else:
+            width_r, SFp, CSp, width_l, crf_exp, hrf_1, hrf_2 =  np.meshgrid(
+                width_r_grid, SFp_grid, CSp_grid, width_l_grid, crf_exp_grid, hrf_1_grid, hrf_2_grid
+                )
+            self.hrf_1 = hrf_1.ravel()
+            self.hrf_2 = hrf_2.ravel()                
+        
+        self.width_r  = width_r.ravel()           
+        self.SFp      = SFp.ravel()       
+        self.CSp     = CSp.ravel()       
+        self.width_l  = width_l.ravel()
+        self.crf_exp  = crf_exp.ravel()
+        self.n_predictions = len(self.width_r)
+
+        self.grid_predictions = self.model.create_grid_predictions(
+            self.width_r,
+            self.SFp,
+            self.CSp,
+            self.width_l,
+            self.crf_exp,
+            self.hrf_1,
+            self.hrf_2)            
+                    
+        # this function analytically computes best-fit rsq, slope, and baseline
+        # for a given batch of units (faster than scipy/numpy lstsq).
+        def rsq_betas_for_batch(data, vox_num, predictions,
+                                n_timepoints, data_var,
+                                sum_preds, square_norm_preds):
+            result = np.zeros((data.shape[0], 4), dtype='float32')
+            for vox_data, num, idx in zip(
+                data, vox_num, np.arange(
+                    data.shape[0])):
+                # bookkeeping
+                sumd = np.sum(vox_data)
+
+                # best slopes and baselines for voxel for predictions
+                # if fixed_grid_baseline is None:
+                if not isinstance(fixed_grid_baseline, float):
+                    slopes = (n_timepoints * np.dot(vox_data, predictions.T) - sumd *
+                              sum_preds) / (n_timepoints * square_norm_preds - sum_preds**2)
+                    baselines = (sumd - slopes * sum_preds) / n_timepoints
+                else:                    
+                    slopes = (np.dot(vox_data-fixed_grid_baseline, predictions.T)) / (square_norm_preds)                   
+                    baselines = fixed_grid_baseline * np.ones_like(slopes)
+
+                # resid and rsq
+                resid = np.linalg.norm((vox_data -
+                                        slopes[..., np.newaxis] *
+                                        predictions -
+                                        baselines[..., np.newaxis]), axis=-
+                                       1, ord=2)
+
+                
+                #enforcing a bound on the grid slope (i.e. prf amplitude)
+                if grid_bounds is not None:
+                    resid[slopes<grid_bounds[0][0]] = +np.inf
+                    resid[slopes>grid_bounds[0][1]] = +np.inf
+                    
+
+                best_pred_voxel = np.nanargmin(resid)
+
+                rsq = 1 - resid[best_pred_voxel]**2 / \
+                    (n_timepoints * data_var[num])
+
+                result[idx, :] = best_pred_voxel, rsq, baselines[best_pred_voxel], slopes[best_pred_voxel]
+
+            return result
+
+        # bookkeeping
+        sum_preds = np.sum(self.grid_predictions, axis=-1)
+        square_norm_preds = np.linalg.norm(
+            self.grid_predictions, axis=-1, ord=2)**2
+
+        # split data in batches
+        split_indices = np.array_split(
+            np.arange(self.data.shape[0]), n_batches)
+        data_batches = np.array_split(self.data, n_batches, axis=0)
+        if verbose:
+            print("Each batch contains approx. " +
+                  str(data_batches[0].shape[0]) + " voxels.")
+
+        # perform grid fit
+        grid_search_rbs = Parallel(self.n_jobs, verbose=verbose)(
+            delayed(rsq_betas_for_batch)(
+                data=data,
+                vox_num=vox_num,
+                predictions=self.grid_predictions,
+                n_timepoints=self.n_timepoints,
+                data_var=self.data_var,
+                sum_preds=sum_preds,
+                square_norm_preds=square_norm_preds)
+            for data, vox_num in zip(data_batches, split_indices))
+
+        grid_search_rbs = np.concatenate(grid_search_rbs, axis=0)
+
+        max_rsqs = grid_search_rbs[:, 0].astype('int')
+        self.gridsearch_r2 = grid_search_rbs[:, 1]
+        self.best_fitting_baseline = grid_search_rbs[:, 2]
+        self.best_fitting_beta = grid_search_rbs[:, 3]
+
+        # output
+        if hrf_1_grid is not None and hrf_2_grid is not None:
+            self.gridsearch_params = np.array([
+                self.width_r[max_rsqs],
+                self.SFp[max_rsqs],
+                self.CSp[max_rsqs],
+                self.width_l[max_rsqs],
+                self.crf_exp[max_rsqs],
+                self.best_fitting_beta,
+                self.best_fitting_baseline,
+                self.hrf_1[max_rsqs],
+                self.hrf_2[max_rsqs],
+                self.gridsearch_r2
+            ]).T
+        elif hasattr(self.model, 'hrf_params'):
+            # If we have specified hrf parameters in the model but we haven't fit them
+            self.gridsearch_params = np.array([
+                self.width_r[max_rsqs],
+                self.SFp[max_rsqs],
+                self.CSp[max_rsqs],
+                self.width_l[max_rsqs],
+                self.crf_exp[max_rsqs],
+                self.best_fitting_beta,
+                self.best_fitting_baseline,
+                self.model.hrf_params[1] * np.ones(self.n_units),
+                self.model.hrf_params[2] * np.ones(self.n_units),
+                self.gridsearch_r2
+            ]).T            
+        else:
+            # I.E in the case where we have specified the HRF inside the model
+            self.gridsearch_params = np.array([
+                self.width_r[max_rsqs],
+                self.SFp[max_rsqs],
+                self.CSp[max_rsqs],
+                self.width_l[max_rsqs],
+                self.crf_exp[max_rsqs],
+                self.best_fitting_beta,
+                self.best_fitting_baseline,
+                self.gridsearch_r2
+            ]).T            
