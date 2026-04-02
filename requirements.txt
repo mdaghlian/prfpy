@@ -3,3 +3,8 @@ scipy>=1.4
 statsmodels>=0.8
 joblib
 nilearn
+PyYaml
+seaborn
+pandas
+matplotlib
+ipywidgets
