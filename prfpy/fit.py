@@ -1569,9 +1569,7 @@ class CFFitter(Fitter):
     leveraging a Model object.
 
     """
-    
-    
-    def grid_fit(self,sigma_grid,verbose=False,n_batches=1000):
+    def grid_fit_old(self,sigma_grid,verbose=False,n_batches=1000):
         
         
         """grid_fit
@@ -1682,8 +1680,103 @@ class CFFitter(Fitter):
         # Put the vertex centres into a dictionary.
         self.vertex_centres=self.gridsearch_params[:,0].astype(int)
         self.vertex_centres_dict = [{'vert':k} for k in self.vertex_centres]
-        
-    def quick_grid_fit(self,sigma_grid):
+
+    def grid_fit(self, sigma_grid, verbose=False, pos_prfs_only=False):
+        """grid_fit
+
+        Performs grid fit using provided grids and predictor definitions.
+        Fully vectorised - no Python loops over voxels.
+
+        Parameters
+        ----------
+        sigma_grid : 1D ndarray
+            to be filled in by user
+        verbose : boolean, optional
+            print output. The default is False.
+        pos_prfs_only : bool, optional
+            If True, only accept predictions with positive betas.
+            The default is False.
+
+        Returns
+        -------
+        gridsearch_params, vertex_centres, vertex_centres_dict
+        """
+
+        self.model.create_grid_predictions(sigma_grid)
+        self.model.predictions = self.model.predictions.astype('float32')  # (P, T)
+
+        n  = self.n_timepoints          # scalar
+        P  = self.model.predictions.shape[0]
+
+        # --- Precompute prediction statistics once ---  (P,)
+        sum_preds       = self.model.predictions.sum(axis=-1)
+        sq_norm_preds   = (self.model.predictions ** 2).sum(axis=-1)
+        denom           = n * sq_norm_preds - sum_preds ** 2   # (P,)
+
+        # --- Data statistics ---  (V,)
+        sum_data = self.data.sum(axis=-1)                      # (V,)
+
+        # --- Dot product of all voxels against all predictions ---
+        # data: (V, T),  predictions.T: (T, P)  ->  (V, P)
+        if verbose:
+            print(f"Computing dot products: {self.data.shape[0]} voxels x {P} predictions")
+
+        dot_dp = self.data @ self.model.predictions.T           # (V, P)
+
+        # --- Vectorised OLS for all voxels x all predictions ---
+        # betas:     (V, P)
+        # baselines: (V, P)
+        betas     = (n * dot_dp - sum_data[:, None] * sum_preds[None, :]) / denom[None, :]
+        baselines = (sum_data[:, None] - betas * sum_preds[None, :]) / n
+
+        # --- Residual sum of squares: (V, P) ---
+        # ||y - beta*x - baseline||^2, expanded to avoid materialising (V, P, T)
+        # ||y||^2 - 2*beta*(y·x) - 2*baseline*sum(y) + beta^2*||x||^2 + 2*beta*baseline*sum(x) + n*baseline^2
+        sq_data  = (self.data ** 2).sum(axis=-1)               # (V,)
+
+        ss_res = (
+            sq_data[:, None]
+            - 2 * betas     * dot_dp
+            - 2 * baselines * sum_data[:, None]
+            + betas     **2 * sq_norm_preds[None, :]
+            + 2 * betas * baselines * sum_preds[None, :]
+            + n * baselines **2
+        )                                                       # (V, P)
+
+        # --- Optionally mask negative-beta predictions ---
+        if pos_prfs_only:
+            ss_res[betas <= 0] = np.inf
+
+        # --- Pick winner per voxel ---
+        best_idxs = np.argmin(ss_res, axis=1)                  # (V,)
+        vox_idx   = np.arange(self.data.shape[0])
+
+        best_ss_res  = ss_res[vox_idx, best_idxs]              # (V,)
+        best_betas     = betas[vox_idx, best_idxs]             # (V,)
+        best_baselines = baselines[vox_idx, best_idxs]         # (V,)
+
+        r2 = 1 - best_ss_res / (n * self.data_var)             # (V,)
+
+        if verbose:
+            print(f"Mean R²: {r2.mean():.3f}")
+
+        # --- Output ---
+        self.gridsearch_r2          = r2
+        self.best_fitting_beta      = best_betas
+        self.best_fitting_baseline  = best_baselines
+
+        self.gridsearch_params = np.array([
+            self.model.vert_centres_flat[best_idxs],
+            self.model.sigmas_flat[best_idxs],
+            best_betas,
+            best_baselines,
+            r2
+        ]).T
+
+        self.vertex_centres      = self.gridsearch_params[:, 0].astype(int)
+        self.vertex_centres_dict = [{'vert': k} for k in self.vertex_centres]
+            
+    def quick_grid_fit(self,sigma_grid, chunk_size=100):
         
         
         """quick_grid_fit
